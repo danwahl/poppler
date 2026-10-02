@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
@@ -22,11 +22,16 @@ memory. CPU-only work does not need poppler.
 directory, which may not be your project.
 - Set `owner` to a name that identifies you, so others can see whose job is \
 running.
-- Pending jobs start in submission order.
+- Every job has a QOS. Pending jobs start in QOS order (high, normal, \
+scavenger), then in submission order. A high or normal job preempts a running \
+scavenger job. Use normal unless the user asks for another QOS.
+- A preempted job is requeued by default: it goes back to pending under the \
+same id and later runs again from the start, with POPPLER_RESTART_COUNT one \
+higher. Scavenger jobs should resume from a checkpoint.
 - A job holds the GPU until it exits, so do not submit long-lived servers \
 unless the user asks for one.
-- When a job is cancelled or reaches its time limit, its processes get \
-SIGTERM, then SIGKILL after the machine's KillWait setting (30 seconds unless \
+- When a job is cancelled, preempted or reaches its time limit, its \
+processes get SIGTERM, then SIGKILL after the machine's KillWait setting (30 seconds unless \
 configured). Long jobs should save a checkpoint on SIGTERM.
 - Submitting jobs, waiting on them and reading logs need no confirmation. \
 Cancel only your own jobs unless the user asks otherwise.
@@ -73,13 +78,32 @@ def submit(
             ge=0, description="Stop the job after this many seconds of running. No limit if unset."
         ),
     ] = None,
+    qos: Annotated[
+        Literal["high", "normal", "scavenger"],
+        Field(
+            description="Quality of service. high and normal jobs preempt scavenger jobs, "
+            "and high jobs start before normal ones. Use normal unless the user asks."
+        ),
+    ] = "normal",
+    requeue: Annotated[
+        bool,
+        Field(description="If preempted, go back to pending and run again later."),
+    ] = True,
 ) -> dict[str, Any]:
     """Queue a command for the GPU and return its job record without waiting.
 
     The job starts once the GPU is free. Output goes to the job's log. Use
     wait_job to block until it finishes and job_log to read its output.
     """
-    job = jobs.submit(command, name=name, owner=owner, cwd=cwd, time_limit=time_limit_s)
+    job = jobs.submit(
+        command,
+        name=name,
+        owner=owner,
+        cwd=cwd,
+        time_limit=time_limit_s,
+        qos=qos,
+        requeue=requeue,
+    )
     return job.to_dict()
 
 

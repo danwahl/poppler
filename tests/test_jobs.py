@@ -259,3 +259,69 @@ def test_finished_jobs_leave_the_active_list(submit):
     assert job.current_state() == "COMPLETED"
     assert jobs.active_jobs() == []
     assert [j.id for j in jobs.all_jobs()] == [job.id]
+
+
+def test_higher_qos_starts_first(submit, tmp_path):
+    holder = wait_running(submit("sleep 0.5").id)
+    ids = [submit(f"echo {qos} >> order", qos=qos).id for qos in ("scavenger", "normal", "high")]
+    for job_id in ids:
+        assert jobs.wait(job_id, timeout=10).current_state() == "COMPLETED"
+    assert (tmp_path / "order").read_text().split() == ["high", "normal", "scavenger"]
+    assert jobs.load(holder.id).current_state() == "COMPLETED"
+
+
+RESUMABLE = (
+    'echo "run $POPPLER_RESTART_COUNT" >> trace; '
+    '[ "$POPPLER_RESTART_COUNT" -gt 0 ] && exit 0; '
+    "trap 'echo checkpoint >> trace; exit 0' TERM; touch ready; sleep 30 & wait"
+)
+
+
+def test_preempted_scavenger_job_is_requeued(submit, tmp_path):
+    scavenger = wait_running(submit(RESUMABLE, qos="scavenger").id)
+    wait_for(lambda: (tmp_path / "ready").exists())
+    urgent = submit("echo urgent >> trace")
+    assert jobs.wait(urgent.id, timeout=10).current_state() == "COMPLETED"
+    finished = jobs.wait(scavenger.id, timeout=10)
+    assert finished.current_state() == "COMPLETED"
+    assert finished.restart_count == 1
+    assert (tmp_path / "trace").read_text().split("\n")[:-1] == [
+        "run 0",
+        "checkpoint",
+        "urgent",
+        "run 1",
+    ]
+    assert "preempted and requeued" in jobs.read_log(scavenger.id)
+
+
+def test_preempted_job_without_requeue_ends(submit):
+    scavenger = wait_running(submit("sleep 30", qos="scavenger", requeue=False).id)
+    urgent = submit("true", qos="high")
+    assert jobs.wait(urgent.id, timeout=10).current_state() == "COMPLETED"
+    finished = jobs.load(scavenger.id)
+    assert finished.current_state() == "PREEMPTED"
+    assert finished.exit_code == -signal.SIGTERM
+
+
+def test_only_scavenger_jobs_are_preempted(submit):
+    holder = wait_running(submit("sleep 1").id)
+    urgent = submit("true", qos="high")
+    time.sleep(0.5)
+    assert jobs.load(holder.id).current_state() == "RUNNING"
+    assert jobs.load(urgent.id).current_state() == "PENDING"
+    assert jobs.wait(urgent.id, timeout=5).current_state() == "COMPLETED"
+    assert jobs.load(holder.id).current_state() == "COMPLETED"
+
+
+def test_cancel_requeued_job(submit, tmp_path):
+    scavenger = wait_running(submit("sleep 30", qos="scavenger").id)
+    holder = submit("sleep 30")
+    wait_for(lambda: jobs.load(scavenger.id).current_state() == "PENDING")
+    assert jobs.load(scavenger.id).restart_count == 1
+    assert jobs.cancel(scavenger.id).current_state() == "CANCELLED"
+    jobs.cancel(holder.id)
+
+
+def test_unknown_qos(submit):
+    with pytest.raises(ValueError, match="unknown QOS"):
+        submit("true", qos="urgent")

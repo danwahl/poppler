@@ -50,11 +50,11 @@ def _age(seconds: float) -> str:
 
 def _table(rows: list[jobs.Job]) -> str:
     now = time.time()
-    lines = [f"{'ID':>4}  {'STATE':<9}  {'OWNER':<12}  {'AGE':>6}  COMMAND"]
+    lines = [f"{'ID':>4}  {'STATE':<9}  {'QOS':<9}  {'OWNER':<12}  {'AGE':>6}  COMMAND"]
     for job in rows:
         label = f"[{job.name}] " if job.name else ""
         lines.append(
-            f"{job.id:>4}  {job.current_state():<9}  {job.owner[:12]:<12}  "
+            f"{job.id:>4}  {job.current_state():<9}  {job.qos:<9}  {job.owner[:12]:<12}  "
             f"{_age(now - job.submitted_at):>6}  {label}{job.command}"[:160]
         )
     return "\n".join(lines)
@@ -72,6 +72,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             name=args.job_name,
             owner=args.owner or getpass.getuser(),
             time_limit=args.time,
+            qos=args.qos,
+            requeue=args.requeue,
         )
     finally:
         signal.signal(signal.SIGINT, previous)
@@ -167,6 +169,20 @@ def parser() -> argparse.ArgumentParser:
         "--time",
         type=_time,
         help="time limit, as minutes, [hours:]minutes:seconds or days-hours[:minutes[:seconds]]",
+    )
+    run.add_argument(
+        "-q",
+        "--qos",
+        choices=list(jobs.QOS),
+        default="normal",
+        help="high and normal jobs preempt scavenger jobs, "
+        "and high jobs start before normal ones (default normal)",
+    )
+    run.add_argument(
+        "--requeue",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="when preempted, go back to pending instead of ending (default --requeue)",
     )
     run.add_argument("-d", "--detach", action="store_true", help="print the job id and return")
     run.add_argument(

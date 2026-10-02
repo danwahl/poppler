@@ -31,9 +31,19 @@ COMPLETED = "COMPLETED"
 FAILED = "FAILED"
 CANCELLED = "CANCELLED"
 TIMEOUT = "TIMEOUT"
+PREEMPTED = "PREEMPTED"
 LOST = "LOST"
 ACTIVE = (PENDING, RUNNING)
 POLL = 0.1
+
+# Fixed QOS levels, as an admin might define them with sacctmgr. Priority
+# orders the pending queue, and a pending job that is first in line preempts
+# a running job whose QOS is in its preempt list.
+QOS = {
+    "high": {"priority": 2, "preempt": ("scavenger",)},
+    "normal": {"priority": 1, "preempt": ("scavenger",)},
+    "scavenger": {"priority": 0, "preempt": ()},
+}
 
 DEFAULT_CONFIG = {"KillWait": 30.0}
 
@@ -126,6 +136,9 @@ class Job:
     owner: str = ""
     cwd: str = ""
     time_limit: float | None = None
+    qos: str = "normal"
+    requeue: bool = True
+    restart_count: int = 0
     state: str = PENDING
     submitted_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -209,8 +222,13 @@ def active_jobs() -> list[Job]:
 
 
 def queue() -> list[Job]:
-    """Return the pending jobs in the order they will start."""
-    return [job for job in active_jobs() if job.current_state() == PENDING]
+    """Return the pending jobs in the order they will start: by QOS priority, then id."""
+    pending = [job for job in active_jobs() if job.current_state() == PENDING]
+    return sorted(pending, key=lambda job: (-QOS[job.qos]["priority"], job.id))
+
+
+def may_preempt(pending: Job, running: Job) -> bool:
+    return running.qos in QOS[pending.qos]["preempt"]
 
 
 def finish(job: Job, state: str, exit_code: int | None = None) -> None:
@@ -229,10 +247,22 @@ def submit(
     owner: str = "",
     cwd: str | None = None,
     time_limit: float | None = None,
+    qos: str = "normal",
+    requeue: bool = True,
 ) -> Job:
     """Record a job and start its runner, which waits for the GPU in the background."""
+    if qos not in QOS:
+        raise ValueError(f"unknown QOS {qos!r}; choose from {', '.join(QOS)}")
     cwd = str(Path(cwd or os.getcwd()).resolve())
-    job = _create(command=command, name=name, owner=owner, cwd=cwd, time_limit=time_limit)
+    job = _create(
+        command=command,
+        name=name,
+        owner=owner,
+        cwd=cwd,
+        time_limit=time_limit,
+        qos=qos,
+        requeue=requeue,
+    )
     with open(job.log_path, "wb") as log:
         subprocess.run(
             [sys.executable, "-m", "poppler.runner", str(job.id)],
@@ -268,6 +298,11 @@ def _signal_runner(job: Job, sig: signal.Signals) -> None:
     if job.runner_alive():
         with contextlib.suppress(ProcessLookupError):
             os.kill(job.runner_pid, sig)
+
+
+def preempt(job: Job) -> None:
+    """Ask a running job's runner to stop the job, and requeue it if it allows that."""
+    _signal_runner(job, signal.SIGUSR1)
 
 
 def cancel(job_id: int) -> Job:
