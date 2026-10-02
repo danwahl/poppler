@@ -15,7 +15,7 @@ from poppler import jobs
 
 
 def _exit_status(job: jobs.Job) -> int:
-    if job.current_state() == "done":
+    if job.current_state() == jobs.COMPLETED:
         return 0
     if job.exit_code is not None and job.exit_code > 0:
         return job.exit_code
@@ -69,10 +69,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     try:
         job = jobs.submit(
             command,
-            name=args.name,
+            name=args.job_name,
             owner=args.owner or getpass.getuser(),
-            timeout=args.timeout,
-            grace=args.grace,
+            time_limit=args.time,
         )
     finally:
         signal.signal(signal.SIGINT, previous)
@@ -106,7 +105,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if info["gpu_busy"] and not info["running"]:
         holders = " ".join(map(str, info["lock_holders"]))
         print(f"The lock is held outside any running job, by pids: {holders}")
-    active = [jobs.load(j["id"]) for state in ("running", "waiting", "lost") for j in info[state]]
+    active = [jobs.load(j["id"]) for state in ("running", "pending", "lost") for j in info[state]]
     if active:
         print(_table(active))
     return 0
@@ -142,6 +141,13 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     return 0
 
 
+def _time(text: str) -> float | None:
+    try:
+        return jobs.parse_time(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def _count(text: str) -> int:
     value = int(text)
     if value < 0:
@@ -154,14 +160,13 @@ def parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(required=True, metavar="COMMAND")
 
     run = sub.add_parser("run", help="run a command once the GPU is free")
-    run.add_argument("--name", default="", help="short label for the job")
+    run.add_argument("-J", "--job-name", default="", help="short label for the job")
     run.add_argument("--owner", help="who is submitting (default: your username)")
-    run.add_argument("--timeout", type=float, help="stop the job after this many seconds")
     run.add_argument(
-        "--grace",
-        type=float,
-        default=10.0,
-        help="seconds between SIGTERM and SIGKILL when stopping (default 10)",
+        "-t",
+        "--time",
+        type=_time,
+        help="time limit, as minutes, [hours:]minutes:seconds or days-hours[:minutes[:seconds]]",
     )
     run.add_argument("-d", "--detach", action="store_true", help="print the job id and return")
     run.add_argument(
@@ -188,7 +193,7 @@ def parser() -> argparse.ArgumentParser:
     log.add_argument("-n", "--tail", type=_count, help="only the last N lines")
     log.set_defaults(func=cmd_log)
 
-    cancel = sub.add_parser("cancel", help="stop a waiting, running or lost job")
+    cancel = sub.add_parser("cancel", help="stop a pending, running or lost job")
     cancel.add_argument("id", type=int)
     cancel.set_defaults(func=cmd_cancel)
 

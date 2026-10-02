@@ -2,7 +2,7 @@
 
 Each job is a JSON file in the jobs directory. submit creates it, the job's
 runner (see runner.py) updates it, and cancel finishes it if the runner has
-died. A record whose runner is gone reads as "lost", so a crashed runner never
+died. A record whose runner is gone reads as LOST, so a crashed runner never
 leaves a job that looks active.
 """
 
@@ -16,12 +16,23 @@ import signal
 import subprocess
 import sys
 import time
+import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-ACTIVE = ("waiting", "running")
+# Slurm's job state names, plus LOST for a job whose runner died.
+PENDING = "PENDING"
+RUNNING = "RUNNING"
+COMPLETED = "COMPLETED"
+FAILED = "FAILED"
+CANCELLED = "CANCELLED"
+TIMEOUT = "TIMEOUT"
+LOST = "LOST"
+ACTIVE = (PENDING, RUNNING)
 POLL = 0.1
+
+DEFAULT_CONFIG = {"KillWait": 30.0}
 
 
 def home() -> Path:
@@ -40,6 +51,47 @@ def jobs_dir() -> Path:
 def lock_path() -> Path:
     jobs_dir()
     return home() / "gpu.lock"
+
+
+def config() -> dict[str, float]:
+    """Read settings from $POPPLER_CONFIG, or config.toml in ~/.config/poppler.
+
+    Settings take their names from slurm.conf. KillWait is the number of
+    seconds between SIGTERM and SIGKILL when a job is stopped.
+    """
+    if path := os.environ.get("POPPLER_CONFIG"):
+        file = Path(path)
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+        file = Path(base) / "poppler" / "config.toml"
+    try:
+        settings = tomllib.loads(file.read_text())
+    except FileNotFoundError:
+        settings = {}
+    if unknown := settings.keys() - DEFAULT_CONFIG.keys():
+        raise ValueError(f"unknown settings in {file}: {', '.join(sorted(unknown))}")
+    return {key: float(settings.get(key, value)) for key, value in DEFAULT_CONFIG.items()}
+
+
+def parse_time(text: str) -> float | None:
+    """Parse a time limit in Slurm's format into seconds, or None for no limit.
+
+    The formats are "minutes", "minutes:seconds", "hours:minutes:seconds",
+    "days-hours", "days-hours:minutes" and "days-hours:minutes:seconds".
+    """
+    if text.upper() in ("UNLIMITED", "INFINITE"):
+        return None
+    days, dash, rest = text.partition("-")
+    parts = rest.split(":") if dash else days.split(":")
+    if dash:
+        units = (3600, 60, 1)[: len(parts)] if len(parts) <= 3 else ()
+    else:
+        units = {1: (60,), 2: (60, 1), 3: (3600, 60, 1)}.get(len(parts), ())
+        days = "0"
+    if not units or not all(part.isdigit() for part in (days, *parts)):
+        raise ValueError(f"invalid time limit {text!r}")
+    seconds = int(days) * 86400
+    return float(seconds + sum(int(part) * unit for part, unit in zip(parts, units, strict=True)))
 
 
 def process_start(pid: int) -> int | None:
@@ -64,9 +116,8 @@ class Job:
     name: str = ""
     owner: str = ""
     cwd: str = ""
-    timeout: float | None = None
-    grace: float = 10.0
-    state: str = "waiting"
+    time_limit: float | None = None
+    state: str = PENDING
     submitted_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
@@ -94,7 +145,7 @@ class Job:
 
     def current_state(self) -> str:
         if self.state in ACTIVE and not self.runner_alive():
-            return "lost"
+            return LOST
         return self.state
 
     def to_dict(self) -> dict[str, Any]:
@@ -142,12 +193,11 @@ def submit(
     name: str = "",
     owner: str = "",
     cwd: str | None = None,
-    timeout: float | None = None,
-    grace: float = 10.0,
+    time_limit: float | None = None,
 ) -> Job:
     """Record a job and start its runner, which waits for the GPU in the background."""
     cwd = str(Path(cwd or os.getcwd()).resolve())
-    job = _create(command=command, name=name, owner=owner, cwd=cwd, timeout=timeout, grace=grace)
+    job = _create(command=command, name=name, owner=owner, cwd=cwd, time_limit=time_limit)
     with open(job.log_path, "wb") as log:
         subprocess.run(
             [sys.executable, "-m", "poppler.runner", str(job.id)],
@@ -195,8 +245,8 @@ def cancel(job_id: int) -> Job:
     state = job.current_state()
     if state in ACTIVE:
         _signal_runner(job, signal.SIGTERM)
-        return wait(job_id, timeout=job.grace + 5)
-    if state == "lost":
+        return wait(job_id, timeout=config()["KillWait"] + 5)
+    if state == LOST:
         # The runner died without cleaning up, so whatever is left of the command's
         # group may still hold the GPU. A pgid stays reserved while any member
         # lives, so unless the leader's pid now belongs to a new process, this
@@ -204,7 +254,7 @@ def cancel(job_id: int) -> Job:
         if job.child_pid is not None and process_start(job.child_pid) in (None, job.child_start):
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(job.child_pid, signal.SIGKILL)
-        job.state = "cancelled"
+        job.state = CANCELLED
         job.finished_at = time.time()
         job.save()
     return job
@@ -257,14 +307,16 @@ def lock_holders() -> list[int]:
 
 
 def status() -> dict[str, Any]:
-    by_state: dict[str, list[dict[str, Any]]] = {"running": [], "waiting": [], "lost": []}
+    by_state: dict[str, list[dict[str, Any]]] = {RUNNING: [], PENDING: [], LOST: []}
     for job in all_jobs():
         if (state := job.current_state()) in by_state:
             by_state[state].append(job.to_dict())
     busy = gpu_busy()
     return {
         "gpu_busy": busy,
-        **by_state,
+        "running": by_state[RUNNING],
+        "pending": by_state[PENDING],
+        "lost": by_state[LOST],
         "lock_holders": lock_holders() if busy else [],
         "gpu": gpu_memory(),
     }

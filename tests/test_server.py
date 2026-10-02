@@ -36,7 +36,7 @@ async def test_submit_wait_and_read_log(tmp_path):
         job_id = submitted.structured_content["id"]
         finished = await client.call_tool("wait_job", {"job_id": job_id, "timeout_s": 5})
         log = await client.call_tool("job_log", {"job_id": job_id})
-    assert finished.structured_content["state"] == "done"
+    assert finished.structured_content["state"] == "COMPLETED"
     assert finished.structured_content["owner"] == "test"
     assert log.content[0].text == "hello\n"
 
@@ -46,4 +46,4 @@ async def test_cancel(tmp_path):
         submitted = await client.call_tool("submit", {"command": "sleep 30", "cwd": str(tmp_path)})
         job_id = submitted.structured_content["id"]
         cancelled = await client.call_tool("cancel_job", {"job_id": job_id})
-    assert cancelled.structured_content["state"] == "cancelled"
+    assert cancelled.structured_content["state"] == "CANCELLED"

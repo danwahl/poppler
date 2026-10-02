@@ -40,14 +40,14 @@ def _group_alive(pgid: int) -> bool:
     return True
 
 
-def _stop(child: subprocess.Popen[bytes], grace: float) -> int:
-    """SIGTERM the job's group, then SIGKILL whatever is left after the grace period.
+def _stop(child: subprocess.Popen[bytes], kill_wait: float) -> int:
+    """SIGTERM the job's group, then SIGKILL whatever is left after kill_wait seconds.
 
-    The whole group gets the grace period, not just its leader: /bin/sh often
+    The whole group gets the time to exit, not just its leader: /bin/sh often
     runs the real command as a child and dies on SIGTERM straight away.
     """
     _killpg(child.pid, signal.SIGTERM)
-    deadline = time.monotonic() + grace
+    deadline = time.monotonic() + kill_wait
     while time.monotonic() < deadline:
         if child.poll() is not None and not _group_alive(child.pid):
             break
@@ -70,7 +70,7 @@ def run(job_id: int) -> None:
 
     def on_signal(signum: int, frame: object) -> None:
         nonlocal stop
-        stop = "cancelled"
+        stop = jobs.CANCELLED
         if waiting:
             raise _Cancelled  # interrupts the blocking flock below
 
@@ -85,10 +85,10 @@ def run(job_id: int) -> None:
             fcntl.flock(lock, fcntl.LOCK_EX)
             waiting = False
         except _Cancelled:
-            _finish(job, "cancelled")
+            _finish(job, jobs.CANCELLED)
             return
 
-        job.state = "running"
+        job.state = jobs.RUNNING
         job.started_at = time.time()
         try:
             child = subprocess.Popen(
@@ -103,13 +103,13 @@ def run(job_id: int) -> None:
             )
         except OSError as e:
             log.write(f"poppler: could not start job: {e}\n".encode())
-            _finish(job, "failed")
+            _finish(job, jobs.FAILED)
             return
         job.child_pid = child.pid
         job.child_start = jobs.process_start(child.pid)
         job.save()
 
-        deadline = None if job.timeout is None else job.started_at + job.timeout
+        deadline = None if job.time_limit is None else job.started_at + job.time_limit
         while True:
             try:
                 exit_code = child.wait(timeout=jobs.POLL)
@@ -117,16 +117,16 @@ def run(job_id: int) -> None:
             except subprocess.TimeoutExpired:
                 pass
             if stop is None and deadline is not None and time.time() >= deadline:
-                stop = "timeout"
+                stop = jobs.TIMEOUT
             if stop is not None:
-                exit_code = _stop(child, job.grace)
+                exit_code = _stop(child, jobs.config()["KillWait"])
                 break
         _killpg(child.pid, signal.SIGKILL)
 
     if stop is not None:
         _finish(job, stop, exit_code)
     else:
-        _finish(job, "done" if exit_code == 0 else "failed", exit_code)
+        _finish(job, jobs.COMPLETED if exit_code == 0 else jobs.FAILED, exit_code)
 
 
 def main() -> None:
@@ -140,7 +140,7 @@ def main() -> None:
         traceback.print_exc()
         job = jobs.load(job_id)
         if job.state in jobs.ACTIVE:
-            _finish(job, "failed")
+            _finish(job, jobs.FAILED)
         sys.exit(1)
 
 
