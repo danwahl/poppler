@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import math
 import os
 import signal
 import subprocess
@@ -35,6 +36,7 @@ PREEMPTED = "PREEMPTED"
 LOST = "LOST"
 ACTIVE = (PENDING, RUNNING)
 POLL = 0.1
+STARTUP = 10  # seconds a new runner has to record its pid
 
 # Fixed QOS levels, as an admin might define them with sacctmgr. Priority
 # orders the pending queue, and a pending job that is first in line preempts
@@ -89,7 +91,15 @@ def config() -> dict[str, float]:
         settings = {}
     if unknown := settings.keys() - DEFAULT_CONFIG.keys():
         raise ValueError(f"unknown settings in {file}: {', '.join(sorted(unknown))}")
-    return {key: float(settings.get(key, value)) for key, value in DEFAULT_CONFIG.items()}
+    values = {key: settings.get(key, value) for key, value in DEFAULT_CONFIG.items()}
+    for key, value in values.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not 0 <= value < math.inf
+        ):
+            raise ValueError(f"{key} in {file} must be a number of seconds, not {value!r}")
+    return {key: float(value) for key, value in values.items()}
 
 
 def parse_time(text: str) -> float | None:
@@ -136,6 +146,7 @@ class Job:
     owner: str = ""
     cwd: str = ""
     time_limit: float | None = None
+    kill_wait: float = DEFAULT_CONFIG["KillWait"]
     qos: str = "normal"
     requeue: bool = True
     restart_count: int = 0
@@ -167,6 +178,8 @@ class Job:
 
     def current_state(self) -> str:
         if self.state in ACTIVE and not self.runner_alive():
+            if self.runner_pid is None and time.time() - self.submitted_at < STARTUP:
+                return self.state  # the runner is still starting
             return LOST
         return self.state
 
@@ -183,6 +196,16 @@ def load(job_id: int) -> Job:
     except FileNotFoundError:
         raise KeyError(f"no job {job_id}") from None
     return Job(**json.loads(text))
+
+
+def load_settled(job_id: int) -> Job:
+    """Load a job, reading it again if it looks lost.
+
+    A runner that records an outcome and exits between the read and the
+    liveness check would otherwise make a finished job look lost.
+    """
+    job = load(job_id)
+    return load(job_id) if job.current_state() == LOST else job
 
 
 def all_jobs() -> list[Job]:
@@ -221,10 +244,13 @@ def active_jobs() -> list[Job]:
     return sorted(found, key=lambda job: job.id)
 
 
+def _priority(job: Job) -> tuple[int, int]:
+    return -QOS[job.qos]["priority"], job.id
+
+
 def queue() -> list[Job]:
     """Return the pending jobs in the order they will start: by QOS priority, then id."""
-    pending = [job for job in active_jobs() if job.current_state() == PENDING]
-    return sorted(pending, key=lambda job: (-QOS[job.qos]["priority"], job.id))
+    return sorted((job for job in active_jobs() if job.current_state() == PENDING), key=_priority)
 
 
 def may_preempt(pending: Job, running: Job) -> bool:
@@ -250,7 +276,10 @@ def submit(
     qos: str = "normal",
     requeue: bool = True,
 ) -> Job:
-    """Record a job and start its runner, which waits for the GPU in the background."""
+    """Record a job and start its runner, which waits for the GPU in the background.
+
+    A time limit of 0 means no limit, as in Slurm.
+    """
     if qos not in QOS:
         raise ValueError(f"unknown QOS {qos!r}; choose from {', '.join(QOS)}")
     cwd = str(Path(cwd or os.getcwd()).resolve())
@@ -259,7 +288,8 @@ def submit(
         name=name,
         owner=owner,
         cwd=cwd,
-        time_limit=time_limit,
+        time_limit=time_limit or None,
+        kill_wait=config()["KillWait"],
         qos=qos,
         requeue=requeue,
     )
@@ -271,11 +301,15 @@ def submit(
             stderr=log,
             check=True,
         )
-    # The runner records its pid on startup; until then the job would read as lost.
-    deadline = time.monotonic() + 10
-    while (job := load(job.id)).runner_pid is None and job.state in ACTIVE:
-        if time.monotonic() > deadline:
-            raise RuntimeError(f"runner for job {job.id} did not start; see {job.log_path}")
+    job = _started(job.id)
+    if job.runner_pid is None:
+        raise RuntimeError(f"runner for job {job.id} did not start; see {job.log_path}")
+    return job
+
+
+def _started(job_id: int) -> Job:
+    """Wait for the job's runner to record its pid, for up to STARTUP seconds after submission."""
+    while (job := load(job_id)).current_state() in ACTIVE and job.runner_pid is None:
         time.sleep(POLL / 10)
     return job
 
@@ -283,7 +317,7 @@ def submit(
 def wait(job_id: int, timeout: float | None = None) -> Job:
     """Block until the job leaves the active states, or until timeout seconds pass."""
     deadline = None if timeout is None else time.monotonic() + timeout
-    while (job := load(job_id)).current_state() in ACTIVE:
+    while (job := load_settled(job_id)).current_state() in ACTIVE:
         if deadline is not None and time.monotonic() >= deadline:
             break
         time.sleep(POLL)
@@ -300,9 +334,29 @@ def _signal_runner(job: Job, sig: signal.Signals) -> None:
             os.kill(job.runner_pid, sig)
 
 
+def _kill_lost(job: Job, state: str) -> None:
+    """Kill what is left of a lost job's processes and record the state."""
+    # The runner died without cleaning up, so whatever is left of the command's
+    # group may still hold the GPU. A pgid stays reserved while any member
+    # lives, so unless the leader's pid now belongs to a new process, this
+    # signal can only reach the job's own processes.
+    if job.child_pid is not None and process_start(job.child_pid) in (None, job.child_start):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(job.child_pid, signal.SIGKILL)
+    finish(job, state)
+
+
 def preempt(job: Job) -> None:
-    """Ask a running job's runner to stop the job, and requeue it if it allows that."""
-    _signal_runner(job, signal.SIGUSR1)
+    """Stop a running job so a pending one can take the GPU.
+
+    A live runner stops the job and requeues it, or ends it as PREEMPTED if it
+    was submitted without requeue. A lost job's processes get SIGKILL, and it
+    ends as PREEMPTED.
+    """
+    if job.current_state() == LOST:
+        _kill_lost(job, PREEMPTED)
+    else:
+        _signal_runner(job, signal.SIGUSR1)
 
 
 def cancel(job_id: int) -> Job:
@@ -311,20 +365,14 @@ def cancel(job_id: int) -> Job:
     A live runner gets SIGTERM and stops the command itself. A lost job's
     process group gets SIGKILL.
     """
-    job = load(job_id)
+    _started(job_id)
+    job = load_settled(job_id)
     state = job.current_state()
     if state in ACTIVE:
         _signal_runner(job, signal.SIGTERM)
-        return wait(job_id, timeout=config()["KillWait"] + 5)
+        return wait(job_id, timeout=job.kill_wait + 5)
     if state == LOST:
-        # The runner died without cleaning up, so whatever is left of the command's
-        # group may still hold the GPU. A pgid stays reserved while any member
-        # lives, so unless the leader's pid now belongs to a new process, this
-        # signal can only reach the job's own processes.
-        if job.child_pid is not None and process_start(job.child_pid) in (None, job.child_start):
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(job.child_pid, signal.SIGKILL)
-        finish(job, CANCELLED)
+        _kill_lost(job, CANCELLED)
     return job
 
 
@@ -362,7 +410,7 @@ def gpu_memory() -> dict[str, int] | None:
 
 
 def lock_holders() -> list[int]:
-    """Return the pids of processes with the lock file open, waiting runners included."""
+    """Return the pids of processes with the lock file open."""
     target = str(lock_path())
     holders = []
     for fd_dir in Path("/proc").glob("[0-9]*/fd"):
@@ -375,16 +423,17 @@ def lock_holders() -> list[int]:
 
 
 def status() -> dict[str, Any]:
-    by_state: dict[str, list[dict[str, Any]]] = {RUNNING: [], PENDING: [], LOST: []}
+    by_state: dict[str, list[Job]] = {RUNNING: [], PENDING: [], LOST: []}
     for job in active_jobs():
         if (state := job.current_state()) in by_state:
-            by_state[state].append(job.to_dict())
+            by_state[state].append(job)
+    by_state[PENDING].sort(key=_priority)
     busy = gpu_busy()
     return {
         "gpu_busy": busy,
-        "running": by_state[RUNNING],
-        "pending": by_state[PENDING],
-        "lost": by_state[LOST],
+        "running": [job.to_dict() for job in by_state[RUNNING]],
+        "pending": [job.to_dict() for job in by_state[PENDING]],
+        "lost": [job.to_dict() for job in by_state[LOST]],
         "lock_holders": lock_holders() if busy else [],
         "gpu": gpu_memory(),
     }

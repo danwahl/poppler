@@ -29,7 +29,7 @@ def _follow(job_id: int, out: BinaryIO) -> jobs.Job:
     job = jobs.load(job_id)
     with open(job.log_path, "rb") as log:
         while True:
-            job = jobs.load(job_id)
+            job = jobs.load_settled(job_id)
             done = job.current_state() not in jobs.ACTIVE
             if chunk := log.read():
                 out.write(chunk)
@@ -175,14 +175,15 @@ def parser() -> argparse.ArgumentParser:
         "--qos",
         choices=list(jobs.QOS),
         default="normal",
-        help="high and normal jobs preempt scavenger jobs, "
-        "and high jobs start before normal ones (default normal)",
+        help="start order high, normal, scavenger; high and normal jobs preempt "
+        "running scavenger jobs (default normal)",
     )
     run.add_argument(
         "--requeue",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="when preempted, go back to pending instead of ending (default --requeue)",
+        help="when preempted, go back to pending instead of ending as PREEMPTED "
+        "(default --requeue)",
     )
     run.add_argument("-d", "--detach", action="store_true", help="print the job id and return")
     run.add_argument(
@@ -224,5 +225,5 @@ def main(argv: list[str] | None = None) -> None:
         args.command = args.command[1:]
     try:
         sys.exit(args.func(args))
-    except KeyError as e:
+    except (KeyError, ValueError) as e:
         sys.exit(f"poppler: {e.args[0]}")

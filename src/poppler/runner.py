@@ -78,9 +78,8 @@ class Runner:
     def wait_for_gpu(self) -> TextIO | None:
         """Return the lock file, locked, once this job is first in the queue.
 
-        While first, preempt any running job this job's QOS allows it to; the
-        signal repeats each poll until that job stops. Returns None if the job
-        is cancelled first.
+        While first, signal any running job this job's QOS may preempt, once per
+        poll until that job stops. Returns None if the job is cancelled first.
         """
         while not self.cancelled:
             pending = jobs.queue()
@@ -92,8 +91,9 @@ class Runner:
                 except BlockingIOError:
                     lock.close()
                 for other in jobs.active_jobs():
-                    if other.current_state() == jobs.RUNNING and jobs.may_preempt(self.job, other):
-                        jobs.preempt(other)
+                    # A lost job that was running may still hold the lock.
+                    if other.state == jobs.RUNNING and jobs.may_preempt(self.job, other):
+                        jobs.preempt(jobs.load_settled(other.id))
             time.sleep(jobs.POLL)
         return None
 
@@ -103,6 +103,9 @@ class Runner:
         self.running = True  # before the record says RUNNING, so no preemption is missed
         job.state = jobs.RUNNING
         job.started_at = time.time()
+        if self.cancelled:
+            self.running = False
+            return jobs.CANCELLED, None
         try:
             child = subprocess.Popen(
                 ["/bin/sh", "-c", job.command],
@@ -142,7 +145,7 @@ class Runner:
                 elif deadline is not None and time.time() >= deadline:
                     stop = jobs.TIMEOUT
                 if stop is not None:
-                    exit_code = _stop(child, jobs.config()["KillWait"])
+                    exit_code = _stop(child, job.kill_wait)
                     break
         finally:
             _killpg(child.pid, signal.SIGKILL)

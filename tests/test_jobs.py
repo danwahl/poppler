@@ -230,6 +230,28 @@ def test_config_rejects_unknown_settings(tmp_path):
         jobs.config()
 
 
+@pytest.mark.parametrize("value", ["-1", "inf", "nan", "true", '"30"'])
+def test_config_rejects_bad_kill_wait(tmp_path, value):
+    (tmp_path / "config.toml").write_text(f"KillWait = {value}\n")
+    with pytest.raises(ValueError, match="number of seconds"):
+        jobs.config()
+
+
+def test_kill_wait_is_fixed_at_submission(submit, tmp_path):
+    (tmp_path / "config.toml").write_text("KillWait = 0.3\n")
+    job = wait_running(submit("trap '' TERM; touch ready; sleep 30").id)
+    (tmp_path / "config.toml").write_text("KillWait = 60\n")
+    wait_for(lambda: (tmp_path / "ready").exists())
+    assert job.kill_wait == 0.3
+    assert jobs.cancel(job.id).exit_code == -signal.SIGKILL
+
+
+def test_time_limit_of_zero_means_no_limit(submit):
+    job = submit("true", time_limit=0)
+    assert job.time_limit is None
+    assert jobs.wait(job.id, timeout=5).current_state() == "COMPLETED"
+
+
 def test_unknown_job():
     with pytest.raises(KeyError):
         jobs.load(999)
@@ -325,3 +347,21 @@ def test_cancel_requeued_job(submit, tmp_path):
 def test_unknown_qos(submit):
     with pytest.raises(ValueError, match="unknown QOS"):
         submit("true", qos="urgent")
+
+
+def test_lost_scavenger_job_is_preempted(submit, tmp_path):
+    scavenger = wait_running(submit("sleep 60 & echo $! > bg.pid; wait", qos="scavenger").id)
+    wait_for(lambda: (tmp_path / "bg.pid").exists())
+    os.kill(scavenger.runner_pid, signal.SIGKILL)
+    wait_for(lambda: jobs.load(scavenger.id).current_state() == "LOST")
+    urgent = submit("true")
+    assert jobs.wait(urgent.id, timeout=5).current_state() == "COMPLETED"
+    assert jobs.load(scavenger.id).current_state() == "PREEMPTED"
+    wait_for(lambda: not alive(int((tmp_path / "bg.pid").read_text())))
+
+
+def test_status_lists_pending_jobs_in_start_order(submit):
+    holder = wait_running(submit("sleep 30").id)
+    ids = [submit("true", qos=qos).id for qos in ("scavenger", "normal", "high")]
+    assert [job["id"] for job in jobs.status()["pending"]] == ids[::-1]
+    jobs.cancel(holder.id)

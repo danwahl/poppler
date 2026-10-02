@@ -25,14 +25,16 @@ running.
 - Every job has a QOS. Pending jobs start in QOS order (high, normal, \
 scavenger), then in submission order. A high or normal job preempts a running \
 scavenger job. Use normal unless the user asks for another QOS.
-- A preempted job is requeued by default: it goes back to pending under the \
-same id and later runs again from the start, with POPPLER_RESTART_COUNT one \
-higher. Scavenger jobs should resume from a checkpoint.
+- A preempted job is requeued by default: it returns to PENDING under the \
+same id and later reruns the same command from the start, with \
+POPPLER_RESTART_COUNT one higher. Its log keeps the output of earlier runs. \
+A scavenger job's command should save a checkpoint on SIGTERM and resume from \
+it when rerun.
 - A job holds the GPU until it exits, so do not submit long-lived servers \
 unless the user asks for one.
 - When a job is cancelled, preempted or reaches its time limit, its \
-processes get SIGTERM, then SIGKILL after the machine's KillWait setting (30 seconds unless \
-configured). Long jobs should save a checkpoint on SIGTERM.
+processes get SIGTERM, then SIGKILL after the machine's KillWait (30 \
+seconds by default). Long jobs should save a checkpoint on SIGTERM.
 - Submitting jobs, waiting on them and reading logs need no confirmation. \
 Cancel only your own jobs unless the user asks otherwise.
 """
@@ -75,25 +77,31 @@ def submit(
     time_limit_s: Annotated[
         float | None,
         Field(
-            ge=0, description="Stop the job after this many seconds of running. No limit if unset."
+            ge=0,
+            description="Stop the job after this many seconds of running. No limit if unset or 0.",
         ),
     ] = None,
     qos: Annotated[
         Literal["high", "normal", "scavenger"],
         Field(
-            description="Quality of service. high and normal jobs preempt scavenger jobs, "
-            "and high jobs start before normal ones. Use normal unless the user asks."
+            description="Pending jobs start in QOS order high, normal, scavenger. A pending "
+            "high or normal job preempts a running scavenger job. "
+            "Use normal unless the user asks for another QOS."
         ),
     ] = "normal",
     requeue: Annotated[
         bool,
-        Field(description="If preempted, go back to pending and run again later."),
+        Field(
+            description="If preempted, return to PENDING and rerun from the start later. "
+            "If false, end as PREEMPTED."
+        ),
     ] = True,
 ) -> dict[str, Any]:
     """Queue a command for the GPU and return its job record without waiting.
 
-    The job starts once the GPU is free. Output goes to the job's log. Use
-    wait_job to block until it finishes and job_log to read its output.
+    The job starts when it is first in the queue and the GPU is free. Output
+    goes to the job's log. Use wait_job to block until it finishes and job_log
+    to read its output.
     """
     job = jobs.submit(
         command,
