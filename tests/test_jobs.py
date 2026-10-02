@@ -233,3 +233,29 @@ def test_config_rejects_unknown_settings(tmp_path):
 def test_unknown_job():
     with pytest.raises(KeyError):
         jobs.load(999)
+
+
+def test_pending_jobs_start_in_submission_order(submit, tmp_path):
+    holder = wait_running(submit("sleep 0.5").id)
+    ids = [submit(f"echo {n} >> order").id for n in range(5)]
+    for job_id in ids:
+        assert jobs.wait(job_id, timeout=10).current_state() == "COMPLETED"
+    assert (tmp_path / "order").read_text().split() == [str(n) for n in range(5)]
+    assert jobs.load(holder.id).current_state() == "COMPLETED"
+
+
+def test_lost_pending_job_does_not_block_the_queue(submit):
+    holder = wait_running(submit("sleep 0.5").id)
+    lost = submit("true")
+    os.kill(lost.runner_pid, signal.SIGKILL)
+    after = submit("true")
+    assert jobs.wait(after.id, timeout=5).current_state() == "COMPLETED"
+    assert jobs.load(lost.id).current_state() == "LOST"
+    assert jobs.wait(holder.id, timeout=5).current_state() == "COMPLETED"
+
+
+def test_finished_jobs_leave_the_active_list(submit):
+    job = jobs.wait(submit("true").id, timeout=5)
+    assert job.current_state() == "COMPLETED"
+    assert jobs.active_jobs() == []
+    assert [j.id for j in jobs.all_jobs()] == [job.id]

@@ -22,7 +22,7 @@ memory. CPU-only work does not need poppler.
 directory, which may not be your project.
 - Set `owner` to a name that identifies you, so others can see whose job is \
 running.
-- Pending jobs do not run in submission order; any of them may go next.
+- Pending jobs start in submission order.
 - A job holds the GPU until it exits, so do not submit long-lived servers \
 unless the user asks for one.
 - When a job is cancelled or reaches its time limit, its processes get \

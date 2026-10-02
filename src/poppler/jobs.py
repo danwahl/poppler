@@ -4,6 +4,9 @@ Each job is a JSON file in the jobs directory. submit creates it, the job's
 runner (see runner.py) updates it, and cancel finishes it if the runner has
 died. A record whose runner is gone reads as LOST, so a crashed runner never
 leaves a job that looks active.
+
+Each unfinished job also has an empty marker file in the active directory, so
+the runners polling the queue read only those records.
 """
 
 from __future__ import annotations
@@ -44,6 +47,12 @@ def home() -> Path:
 
 def jobs_dir() -> Path:
     path = home() / "jobs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def active_dir() -> Path:
+    path = home() / "active"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -184,7 +193,33 @@ def _create(**fields: Any) -> Job:
             continue
         job = Job(id=next_id, **fields)
         job.save()
+        (active_dir() / str(job.id)).touch()
         return job
+
+
+def active_jobs() -> list[Job]:
+    """Return the pending, running and lost jobs."""
+    found = []
+    for marker in active_dir().iterdir():
+        try:
+            found.append(load(int(marker.name)))
+        except (KeyError, OSError, ValueError, TypeError):
+            continue  # finished since the directory was listed
+    return sorted(found, key=lambda job: job.id)
+
+
+def queue() -> list[Job]:
+    """Return the pending jobs in the order they will start."""
+    return [job for job in active_jobs() if job.current_state() == PENDING]
+
+
+def finish(job: Job, state: str, exit_code: int | None = None) -> None:
+    """Record a job's outcome and remove it from the active jobs."""
+    job.state = state
+    job.exit_code = exit_code
+    job.finished_at = time.time()
+    job.save()
+    (active_dir() / str(job.id)).unlink(missing_ok=True)
 
 
 def submit(
@@ -254,9 +289,7 @@ def cancel(job_id: int) -> Job:
         if job.child_pid is not None and process_start(job.child_pid) in (None, job.child_start):
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(job.child_pid, signal.SIGKILL)
-        job.state = CANCELLED
-        job.finished_at = time.time()
-        job.save()
+        finish(job, CANCELLED)
     return job
 
 
@@ -308,7 +341,7 @@ def lock_holders() -> list[int]:
 
 def status() -> dict[str, Any]:
     by_state: dict[str, list[dict[str, Any]]] = {RUNNING: [], PENDING: [], LOST: []}
-    for job in all_jobs():
+    for job in active_jobs():
         if (state := job.current_state()) in by_state:
             by_state[state].append(job.to_dict())
     busy = gpu_busy()

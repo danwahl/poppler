@@ -4,7 +4,7 @@ poppler lets the people and agents sharing a single-GPU machine take turns on it
 
 ## How it works
 
-The GPU is guarded by one `flock` on `gpu.lock` in `$POPPLER_HOME`, or `~/.local/state/poppler` by default. Each job gets a small runner process that waits for the lock, runs the command with `/bin/sh -c` in its own process group, and records the outcome.
+The GPU is guarded by one `flock` on `gpu.lock` in `$POPPLER_HOME`, or `~/.local/state/poppler` by default. Each job gets a small runner process that waits until its job is first in the queue and the lock is free, runs the command with `/bin/sh -c` in its own process group, and records the outcome.
 
 The command inherits the lock's file descriptor, so the kernel releases the lock when the last job process exits, even if the job crashes on startup or is killed with SIGKILL. No daemon is involved.
 
@@ -56,9 +56,8 @@ The server's tools are `gpu_status`, `submit`, `wait_job`, `job_log`, `list_jobs
 - One Unix account: the lock lives in that user's state directory.
 - Only cooperating users are covered. A process that uses the GPU without going through poppler is invisible to it.
 - One job holds the GPU at a time. Jobs cannot share it, even when their combined memory would fit.
-- Pending jobs are not served in submission order; the kernel wakes an arbitrary waiter.
 - Linux only: liveness checks read `/proc`.
-- Old job records and logs are never deleted.
+- Old job records and logs are never deleted. Pending runners read only the unfinished jobs, so old records do not slow the queue.
 
 ## Development
 
