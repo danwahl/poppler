@@ -1,6 +1,7 @@
 import pytest
 from mcp import Client
 
+from poppler import jobs
 from poppler.server import mcp
 
 pytestmark = pytest.mark.anyio
@@ -20,6 +21,7 @@ async def test_every_parameter_is_described():
         "wait_job",
         "job_log",
         "list_jobs",
+        "job_info",
         "cancel_job",
     }
     for tool in tools:
@@ -49,3 +51,16 @@ async def test_cancel(tmp_path):
         job_id = submitted.structured_content["id"]
         cancelled = await client.call_tool("cancel_job", {"job_id": job_id})
     assert cancelled.structured_content["state"] == "CANCELLED"
+
+
+async def test_list_jobs_filters_and_summarizes(tmp_path):
+    mine = jobs.wait(jobs.submit("true", owner="me", cwd=str(tmp_path)).id, timeout=5)
+    jobs.wait(jobs.submit("exit 1", owner="me", cwd=str(tmp_path)).id, timeout=5)
+    jobs.wait(jobs.submit("true", owner="you", cwd=str(tmp_path)).id, timeout=5)
+    async with Client(mcp) as client:
+        listed = await client.call_tool("list_jobs", {"owner": "me", "states": ["COMPLETED"]})
+        info = await client.call_tool("job_info", {"job_id": mine.id})
+    rows = listed.structured_content["result"]
+    assert [row["id"] for row in rows] == [mine.id]
+    assert "cwd" not in rows[0]
+    assert info.structured_content["cwd"] == str(tmp_path)

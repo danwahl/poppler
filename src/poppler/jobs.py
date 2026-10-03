@@ -23,7 +23,7 @@ import time
 import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, get_args
 
 # Slurm's job state names, plus LOST for a job whose runner died.
 PENDING = "PENDING"
@@ -35,6 +35,10 @@ TIMEOUT = "TIMEOUT"
 PREEMPTED = "PREEMPTED"
 LOST = "LOST"
 ACTIVE = (PENDING, RUNNING)
+State = Literal[
+    "PENDING", "RUNNING", "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "PREEMPTED", "LOST"
+]
+STATES: tuple[str, ...] = get_args(State)
 POLL = 0.1
 STARTUP = 10  # seconds a new runner has to record its pid
 
@@ -149,6 +153,8 @@ class Job:
     kill_wait: float = DEFAULT_CONFIG["KillWait"]
     qos: str = "normal"
     requeue: bool = True
+    dependency: str = ""
+    env: dict[str, str] = field(default_factory=dict)
     restart_count: int = 0
     state: str = PENDING
     submitted_at: float = field(default_factory=time.time)
@@ -170,7 +176,10 @@ class Job:
 
     def save(self) -> None:
         tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(asdict(self)))
+        # Records can hold secrets passed in env, so only the owner may read them.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with open(fd, "w") as f:
+            f.write(json.dumps(asdict(self)))
         tmp.replace(self.path)
 
     def runner_alive(self) -> bool:
@@ -188,6 +197,25 @@ class Job:
         data["state"] = self.current_state()
         data["log"] = str(self.log_path)
         return data
+
+    def summary(self) -> dict[str, Any]:
+        """Return the fields worth showing in a list of jobs."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "owner": self.owner,
+            "qos": self.qos,
+            "state": self.current_state(),
+            "exit_code": self.exit_code,
+            "dependency": self.dependency,
+            "time_limit": self.time_limit,
+            "requeue": self.requeue,
+            "restart_count": self.restart_count,
+            "submitted_at": self.submitted_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "command": self.command,
+        }
 
 
 def load(job_id: int) -> Job:
@@ -248,9 +276,83 @@ def _priority(job: Job) -> tuple[int, int]:
     return -QOS[job.qos]["priority"], job.id
 
 
+def select(owner: str | None = None, states: list[str] | None = None) -> list[Job]:
+    """Return every job, oldest first, optionally only one owner's or those in some states."""
+    return [
+        job
+        for job in all_jobs()
+        if (owner is None or job.owner == owner) and (not states or job.current_state() in states)
+    ]
+
+
+def parse_dependency(text: str) -> list[tuple[str, list[int]]]:
+    """Parse a Slurm dependency list such as "afterok:16:17,afterany:18".
+
+    Every condition must hold. Slurm's other dependency types, and "?" for
+    any one condition, are not supported.
+    """
+    conditions = []
+    for part in filter(None, text.split(",")):
+        kind, *ids = part.split(":")
+        if kind not in ("afterok", "afterany") or not ids or not all(i.isdecimal() for i in ids):
+            raise ValueError(
+                f"invalid dependency {part!r}; use afterok:ID[:ID...] or afterany:ID[:ID...]"
+            )
+        conditions.append((kind, [int(i) for i in ids]))
+    return conditions
+
+
+# Ended jobs never change state, so each process remembers them.
+_ended: dict[int, str] = {}
+
+
+def _dependency_target_state(job_id: int) -> str | None:
+    """Return a dependency target's state, or None if its record is gone."""
+    if job_id in _ended:
+        return _ended[job_id]
+    try:
+        state = load_settled(job_id).current_state()
+    except KeyError:
+        return None
+    except (OSError, ValueError, TypeError):
+        return PENDING  # reserved but not yet written
+    if state not in (*ACTIVE, LOST):
+        _ended[job_id] = state
+    return state
+
+
+def dependency_state(job: Job) -> str:
+    """Return "met", "waiting" or "never" for the job's dependencies.
+
+    afterok needs each job to end COMPLETED; afterany needs each job to end in
+    any state. A LOST job has not ended, since it may still be cancelled. A
+    job whose record is gone can never satisfy a dependency.
+    """
+    try:
+        conditions = parse_dependency(job.dependency)
+    except ValueError:
+        return "never"
+    met = True
+    for kind, ids in conditions:
+        for dep_id in ids:
+            state = _dependency_target_state(dep_id)
+            if state is None:
+                return "never"
+            if state in (*ACTIVE, LOST):
+                met = False
+            elif kind == "afterok" and state != COMPLETED:
+                return "never"
+    return "met" if met else "waiting"
+
+
 def queue() -> list[Job]:
-    """Return the pending jobs in the order they will start: by QOS priority, then id."""
-    return sorted((job for job in active_jobs() if job.current_state() == PENDING), key=_priority)
+    """Return the pending jobs that may start, in the order they will start.
+
+    Jobs whose dependencies are not met are left out. The rest are ordered by
+    QOS priority, then id.
+    """
+    pending = (job for job in active_jobs() if job.current_state() == PENDING)
+    return sorted((job for job in pending if dependency_state(job) == "met"), key=_priority)
 
 
 def may_preempt(pending: Job, running: Job) -> bool:
@@ -275,13 +377,26 @@ def submit(
     time_limit: float | None = None,
     qos: str = "normal",
     requeue: bool = True,
+    dependency: str = "",
+    env: dict[str, str] | None = None,
 ) -> Job:
     """Record a job and start its runner, which waits for the GPU in the background.
 
-    A time limit of 0 means no limit, as in Slurm.
+    A time limit of 0 means no limit, as in Slurm. env adds to the environment
+    the job inherits from the caller.
     """
     if qos not in QOS:
         raise ValueError(f"unknown QOS {qos!r}; choose from {', '.join(QOS)}")
+    conditions = parse_dependency(dependency)
+    for _, ids in conditions:
+        for dep_id in ids:
+            load(dep_id)  # a KeyError names a missing job
+    dependency = ",".join(f"{kind}:{':'.join(map(str, ids))}" for kind, ids in conditions)
+    env = env or {}
+    if bad := [key for key in env if not key or "=" in key or "\0" in key]:
+        raise ValueError(f"invalid environment variable name {bad[0]!r}")
+    if bad := [key for key, value in env.items() if "\0" in value]:
+        raise ValueError(f"environment variable {bad[0]} contains a null byte")
     cwd = str(Path(cwd or os.getcwd()).resolve())
     job = _create(
         command=command,
@@ -292,6 +407,8 @@ def submit(
         kill_wait=config()["KillWait"],
         qos=qos,
         requeue=requeue,
+        dependency=dependency,
+        env=env,
     )
     with open(job.log_path, "wb") as log:
         subprocess.run(
@@ -423,17 +540,28 @@ def lock_holders() -> list[int]:
 
 
 def status() -> dict[str, Any]:
+    """Return the GPU's state and summaries of the active jobs.
+
+    Pending jobs are in start order, each with Slurm's reason for waiting.
+    Jobs waiting on dependencies come last.
+    """
     by_state: dict[str, list[Job]] = {RUNNING: [], PENDING: [], LOST: []}
     for job in active_jobs():
         if (state := job.current_state()) in by_state:
             by_state[state].append(job)
-    by_state[PENDING].sort(key=_priority)
+    deps = {job.id: dependency_state(job) for job in by_state[PENDING]}
+    by_state[PENDING].sort(key=lambda job: (deps[job.id] != "met", *_priority(job)))
+    reasons = {"waiting": "Dependency", "never": "DependencyNeverSatisfied"}
+    pending = []
+    for job in by_state[PENDING]:
+        reason = reasons.get(deps[job.id]) or ("Priority" if pending else "Resources")
+        pending.append({**job.summary(), "reason": reason})
     busy = gpu_busy()
     return {
         "gpu_busy": busy,
-        "running": [job.to_dict() for job in by_state[RUNNING]],
-        "pending": [job.to_dict() for job in by_state[PENDING]],
-        "lost": [job.to_dict() for job in by_state[LOST]],
+        "running": [job.summary() for job in by_state[RUNNING]],
+        "pending": pending,
+        "lost": [job.summary() for job in by_state[LOST]],
         "lock_holders": lock_holders() if busy else [],
         "gpu": gpu_memory(),
     }

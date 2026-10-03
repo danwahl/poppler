@@ -365,3 +365,84 @@ def test_status_lists_pending_jobs_in_start_order(submit):
     ids = [submit("true", qos=qos).id for qos in ("scavenger", "normal", "high")]
     assert [job["id"] for job in jobs.status()["pending"]] == ids[::-1]
     jobs.cancel(holder.id)
+
+
+def test_afterok_waits_for_the_job_to_complete(submit, tmp_path):
+    holder = wait_running(submit("sleep 0.5").id)
+    first = submit("echo first >> trace")
+    second = submit("echo second >> trace", qos="high", dependency=f"afterok:{first.id}")
+    assert jobs.wait(second.id, timeout=10).current_state() == "COMPLETED"
+    assert (tmp_path / "trace").read_text().split() == ["first", "second"]
+    assert jobs.load(holder.id).current_state() == "COMPLETED"
+
+
+def test_afterok_on_a_failed_job_cancels_the_dependent(submit):
+    failed = jobs.wait(submit("exit 1").id, timeout=5)
+    dependent = jobs.wait(submit("true", dependency=f"afterok:{failed.id}").id, timeout=5)
+    assert dependent.current_state() == "CANCELLED"
+    assert dependent.started_at is None
+    assert "can never be satisfied" in jobs.read_log(dependent.id)
+
+
+def test_a_job_waiting_on_a_dependency_neither_preempts_nor_blocks(submit):
+    scavenger = wait_running(submit("sleep 30", qos="scavenger").id)
+    dependent = submit("true", qos="high", dependency=f"afterany:{scavenger.id}")
+    time.sleep(0.5)
+    assert jobs.load(scavenger.id).current_state() == "RUNNING"
+    assert jobs.status()["pending"][0]["reason"] == "Dependency"
+    jobs.cancel(scavenger.id)
+    assert jobs.wait(dependent.id, timeout=5).current_state() == "COMPLETED"
+
+
+def test_pending_reasons(submit):
+    holder = wait_running(submit("sleep 30").id)
+    ids = [submit("true").id for _ in range(2)]
+    reasons = {job["id"]: job["reason"] for job in jobs.status()["pending"]}
+    assert reasons == {ids[0]: "Resources", ids[1]: "Priority"}
+    jobs.cancel(holder.id)
+
+
+@pytest.mark.parametrize("text", ["after:1", "afterok", "afterok:x", "afterok:1?afterany:1"])
+def test_invalid_dependency(submit, text):
+    with pytest.raises(ValueError, match="invalid dependency"):
+        submit("true", dependency=text)
+
+
+def test_dependency_on_a_missing_job(submit):
+    with pytest.raises(KeyError, match="no job 99"):
+        submit("true", dependency="afterany:99")
+
+
+def test_env_adds_to_the_environment(submit):
+    job = jobs.wait(submit('echo "$GREETING $HOME"', env={"GREETING": "hi"}).id, timeout=5)
+    assert jobs.read_log(job.id) == f"hi {os.environ['HOME']}\n"
+
+
+def test_select_filters_by_owner_and_state(submit):
+    done = jobs.wait(submit("true", owner="a").id, timeout=5)
+    jobs.wait(submit("exit 1", owner="a").id, timeout=5)
+    jobs.wait(submit("true", owner="b").id, timeout=5)
+    assert [job.id for job in jobs.select("a", ["COMPLETED"])] == [done.id]
+    assert len(jobs.select(states=["FAILED", "COMPLETED"])) == 3
+
+
+def test_a_missing_dependency_record_cancels_only_its_dependent(submit):
+    holder = wait_running(submit("sleep 30").id)
+    target = submit("true")
+    dependent = submit("true", dependency=f"afterok:{target.id}")
+    other = submit("true")
+    jobs.cancel(target.id)
+    (jobs.jobs_dir() / f"{target.id}.json").unlink()
+    assert jobs.wait(dependent.id, timeout=5).current_state() == "CANCELLED"
+    jobs.cancel(holder.id)
+    assert jobs.wait(other.id, timeout=10).current_state() == "COMPLETED"
+
+
+def test_env_value_with_a_null_byte_is_rejected(submit):
+    with pytest.raises(ValueError, match="null byte"):
+        submit("true", env={"A": "x\0y"})
+
+
+def test_records_are_private(submit):
+    job = submit("true")
+    assert job.path.stat().st_mode & 0o777 == 0o600

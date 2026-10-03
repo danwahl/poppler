@@ -48,13 +48,17 @@ def _age(seconds: float) -> str:
     return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
 
 
-def _table(rows: list[jobs.Job]) -> str:
+def _table(rows: list[jobs.Job], reasons: dict[int, str] | None = None) -> str:
+    """Format jobs as a table, with a REASON column if reasons are given."""
     now = time.time()
-    lines = [f"{'ID':>4}  {'STATE':<9}  {'QOS':<9}  {'OWNER':<12}  {'AGE':>6}  COMMAND"]
+    reason = f"{'REASON':<10}  " if reasons is not None else ""
+    lines = [f"{'ID':>4}  {'STATE':<9}  {reason}{'QOS':<9}  {'OWNER':<12}  {'AGE':>6}  COMMAND"]
     for job in rows:
         label = f"[{job.name}] " if job.name else ""
+        if reasons is not None:
+            reason = f"{reasons.get(job.id, ''):<10}  "
         lines.append(
-            f"{job.id:>4}  {job.current_state():<9}  {job.qos:<9}  {job.owner[:12]:<12}  "
+            f"{job.id:>4}  {job.current_state():<9}  {reason}{job.qos:<9}  {job.owner[:12]:<12}  "
             f"{_age(now - job.submitted_at):>6}  {label}{job.command}"[:160]
         )
     return "\n".join(lines)
@@ -62,7 +66,7 @@ def _table(rows: list[jobs.Job]) -> str:
 
 def cmd_run(args: argparse.Namespace) -> int:
     if not args.command:
-        sys.exit("poppler run: no command given")
+        sys.exit("poppler run: no command given (-d is --dependency; use --detach to detach)")
     command = args.command[0] if len(args.command) == 1 else shlex.join(args.command)
     # Submitting takes a moment; an interrupt then would orphan a job we can't name.
     previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -74,6 +78,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             time_limit=args.time,
             qos=args.qos,
             requeue=args.requeue,
+            dependency=args.dependency,
+            env=args.export,
+            cwd=args.chdir,
         )
     finally:
         signal.signal(signal.SIGINT, previous)
@@ -109,12 +116,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"The lock is held outside any running job, by pids: {holders}")
     active = [jobs.load(j["id"]) for state in ("running", "pending", "lost") for j in info[state]]
     if active:
-        print(_table(active))
+        print(_table(active, {j["id"]: j["reason"] for j in info["pending"]}))
     return 0
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    rows = jobs.all_jobs()[-args.limit :] if args.limit else jobs.all_jobs()
+    rows = jobs.select(args.owner, args.states)
+    rows = rows[-args.limit :] if args.limit else rows
     if args.json:
         print(json.dumps([job.to_dict() for job in rows], indent=2))
     else:
@@ -148,6 +156,28 @@ def _time(text: str) -> float | None:
         return jobs.parse_time(text)
     except ValueError as e:
         raise argparse.ArgumentTypeError(str(e)) from None
+
+
+def _dependency(text: str) -> str:
+    try:
+        jobs.parse_dependency(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    return text
+
+
+def _export(text: str) -> dict[str, str]:
+    first, *rest = text.split(",")
+    if first != "ALL" or any("=" not in item for item in rest):
+        raise argparse.ArgumentTypeError("only ALL or ALL,NAME=value[,...] is supported")
+    return dict(item.split("=", 1) for item in rest)
+
+
+def _states(text: str) -> list[str]:
+    states = [state.upper() for state in text.split(",")]
+    if unknown := set(states) - set(jobs.STATES):
+        raise argparse.ArgumentTypeError(f"unknown state {sorted(unknown)[0]}")
+    return states
 
 
 def _count(text: str) -> int:
@@ -185,7 +215,24 @@ def parser() -> argparse.ArgumentParser:
         help="when preempted, go back to pending instead of ending as PREEMPTED "
         "(default --requeue)",
     )
-    run.add_argument("-d", "--detach", action="store_true", help="print the job id and return")
+    run.add_argument(
+        "-d",
+        "--dependency",
+        type=_dependency,
+        default="",
+        help="start after other jobs end: afterok:ID[:ID...] once they complete "
+        "(cancelled if one does not), afterany:ID[:ID...] once they end in any state; "
+        "join conditions with commas",
+    )
+    run.add_argument(
+        "--export",
+        type=_export,
+        help="ALL,NAME=value[,...] adds variables to the job's environment",
+    )
+    run.add_argument(
+        "-D", "--chdir", help="directory to run the job in (default: the current directory)"
+    )
+    run.add_argument("--detach", action="store_true", help="print the job id and return")
     run.add_argument(
         "command",
         nargs=argparse.REMAINDER,
@@ -198,6 +245,10 @@ def parser() -> argparse.ArgumentParser:
     status.set_defaults(func=cmd_status)
 
     lst = sub.add_parser("list", help="list recent jobs")
+    lst.add_argument("-u", "--owner", help="only jobs with this owner")
+    lst.add_argument(
+        "-t", "--states", type=_states, help="only jobs in these states, e.g. PENDING,RUNNING"
+    )
     lst.add_argument(
         "-n", "--limit", type=_count, default=20, help="jobs to show (default 20, 0 for all)"
     )
