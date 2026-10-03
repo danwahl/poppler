@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
@@ -12,8 +12,8 @@ from poppler import jobs
 
 INSTRUCTIONS = """\
 This machine has one GPU, shared by several agents and people. poppler gives \
-it to one job at a time: a submitted job waits until the GPU is free, runs, \
-and releases it when it exits.
+it to one job at a time: a submitted job is PENDING until the GPU is free, \
+then RUNNING, and releases the GPU when it exits.
 
 - Run every command that uses the GPU through `submit`, not directly. That \
 includes training, evaluation and inference: anything that allocates GPU \
@@ -22,12 +22,19 @@ memory. CPU-only work does not need poppler.
 directory, which may not be your project.
 - Set `owner` to a name that identifies you, so others can see whose job is \
 running.
-- Waiting jobs do not run in submission order; any of them may go next.
+- Every job has a QOS. Pending jobs start in QOS order (high, normal, \
+scavenger), then in submission order. A high or normal job preempts a running \
+scavenger job. Use normal unless the user asks for another QOS.
+- A preempted job is requeued by default: it returns to PENDING under the \
+same id and later reruns the same command from the start, with \
+POPPLER_RESTART_COUNT one higher. Its log keeps the output of earlier runs. \
+A scavenger job's command should save a checkpoint on SIGTERM and resume from \
+it when rerun.
 - A job holds the GPU until it exits, so do not submit long-lived servers \
 unless the user asks for one.
-- When a job is cancelled or times out, its processes get SIGTERM, then \
-SIGKILL after `grace_s` seconds. Long jobs should save a checkpoint on \
-SIGTERM.
+- When a job is cancelled, preempted or reaches its time limit, its \
+processes get SIGTERM, then SIGKILL after the machine's KillWait (30 \
+seconds by default). Long jobs should save a checkpoint on SIGTERM.
 - Submitting jobs, waiting on them and reading logs need no confirmation. \
 Cancel only your own jobs unless the user asks otherwise.
 """
@@ -43,7 +50,7 @@ JobId = Annotated[int, Field(description="Job id, as returned by submit or list_
 def gpu_status() -> dict[str, Any]:
     """Show whether the GPU is busy, GPU memory and utilization, and active jobs.
 
-    Jobs reported as "lost" had their runner die without recording an outcome;
+    LOST jobs had their runner die without recording an outcome;
     their command may still hold the GPU until cancelled. lock_holders lists
     the pids with the lock open whenever the GPU is busy.
     """
@@ -67,23 +74,44 @@ def submit(
             "Defaults to the MCP server's working directory."
         ),
     ] = None,
-    timeout_s: Annotated[
+    time_limit_s: Annotated[
         float | None,
         Field(
-            ge=0, description="Stop the job after this many seconds of running. No limit if unset."
+            ge=0,
+            description="Stop the job after this many seconds of running. No limit if unset or 0.",
         ),
     ] = None,
-    grace_s: Annotated[
-        float,
-        Field(ge=0, description="Seconds between SIGTERM and SIGKILL when the job is stopped."),
-    ] = 10.0,
+    qos: Annotated[
+        Literal["high", "normal", "scavenger"],
+        Field(
+            description="Pending jobs start in QOS order high, normal, scavenger. A pending "
+            "high or normal job preempts a running scavenger job. "
+            "Use normal unless the user asks for another QOS."
+        ),
+    ] = "normal",
+    requeue: Annotated[
+        bool,
+        Field(
+            description="If preempted, return to PENDING and rerun from the start later. "
+            "If false, end as PREEMPTED."
+        ),
+    ] = True,
 ) -> dict[str, Any]:
     """Queue a command for the GPU and return its job record without waiting.
 
-    The job starts once the GPU is free. Output goes to the job's log. Use
-    wait_job to block until it finishes and job_log to read its output.
+    The job starts when it is first in the queue and the GPU is free. Output
+    goes to the job's log. Use wait_job to block until it finishes and job_log
+    to read its output.
     """
-    job = jobs.submit(command, name=name, owner=owner, cwd=cwd, timeout=timeout_s, grace=grace_s)
+    job = jobs.submit(
+        command,
+        name=name,
+        owner=owner,
+        cwd=cwd,
+        time_limit=time_limit_s,
+        qos=qos,
+        requeue=requeue,
+    )
     return job.to_dict()
 
 
@@ -97,7 +125,7 @@ def wait_job(
 ) -> dict[str, Any]:
     """Wait for a job to finish and return its record.
 
-    If the job is still waiting or running when timeout_s passes, the record
+    If the job is still pending or running when timeout_s passes, the record
     shows that state; call again to keep waiting.
     """
     return jobs.wait(job_id, timeout_s).to_dict()
@@ -127,9 +155,9 @@ def list_jobs(
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, openWorldHint=False))
 def cancel_job(job_id: JobId) -> dict[str, Any]:
-    """Cancel a waiting, running or lost job and return its record.
+    """Cancel a pending, running or lost job and return its record.
 
-    A running job gets SIGTERM, then SIGKILL after its grace period; a lost
+    A running job gets SIGTERM, then SIGKILL after KillWait seconds; a lost
     job's processes get SIGKILL. A job that is slow to stop may still show as
     running; check it again with wait_job.
     """

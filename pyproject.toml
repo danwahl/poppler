@@ -3,6 +3,8 @@ name = "poppler"
 version = "0.1.0"
 description = "Take turns on a single GPU: a lock, a job runner and an MCP server for agents"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Dan Wahl", email = "hi@danwahl.net" }
 ]

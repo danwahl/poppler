@@ -41,7 +41,7 @@ def test_ctrl_c_cancels_the_job(tmp_path):
     proc.send_signal(signal.SIGINT)
     proc.wait(timeout=15)
     assert proc.returncode == 128 + signal.SIGTERM
-    assert jobs.load(1).current_state() == "cancelled"
+    assert jobs.load(1).current_state() == "CANCELLED"
 
 
 def test_log_follow_prints_until_the_job_ends(tmp_path):
@@ -52,10 +52,17 @@ def test_log_follow_prints_until_the_job_ends(tmp_path):
 
 
 def test_detach_prints_job_id(tmp_path):
-    result = poppler("run", "-d", "--name", "quick", "--", "true", cwd=tmp_path)
+    result = poppler("run", "-d", "-J", "quick", "--", "true", cwd=tmp_path)
     job = jobs.wait(int(result.stdout), timeout=5)
     assert job.name == "quick"
-    assert job.current_state() == "done"
+    assert job.current_state() == "COMPLETED"
+
+
+def test_time_limit_takes_slurm_format(tmp_path):
+    result = poppler("run", "-t", "0:01", "--", "sleep 30", cwd=tmp_path)
+    assert result.returncode == 128 + signal.SIGTERM
+    assert "TIMEOUT" in result.stderr
+    assert "invalid time limit" in poppler("run", "-t", "1h", "--", "true").stderr
 
 
 def test_status_and_list(tmp_path):
@@ -64,7 +71,7 @@ def test_status_and_list(tmp_path):
     assert status["gpu_busy"] is False
     assert status["running"] == []
     listed = poppler("list").stdout
-    assert "done" in listed
+    assert "COMPLETED" in listed
 
 
 def test_unknown_job_is_an_error():
