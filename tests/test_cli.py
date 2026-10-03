@@ -45,14 +45,15 @@ def test_ctrl_c_cancels_the_job(tmp_path):
 
 
 def test_log_follow_prints_until_the_job_ends(tmp_path):
-    job_id = int(poppler("run", "-d", "--", "echo one; sleep 0.5; echo two", cwd=tmp_path).stdout)
+    result = poppler("run", "--detach", "--", "echo one; sleep 0.5; echo two", cwd=tmp_path)
+    job_id = int(result.stdout)
     start = time.monotonic()
     assert poppler("log", "-f", str(job_id)).stdout == "one\ntwo\n"
     assert time.monotonic() - start >= 0.3
 
 
 def test_detach_prints_job_id(tmp_path):
-    result = poppler("run", "-d", "-J", "quick", "--", "true", cwd=tmp_path)
+    result = poppler("run", "--detach", "-J", "quick", "--", "true", cwd=tmp_path)
     job = jobs.wait(int(result.stdout), timeout=5)
     assert job.name == "quick"
     assert job.current_state() == "COMPLETED"
@@ -78,3 +79,31 @@ def test_unknown_job_is_an_error():
     result = poppler("log", "999")
     assert result.returncode == 1
     assert "no job 999" in result.stderr
+
+
+def test_export_chdir_and_dependency(tmp_path):
+    (tmp_path / "sub").mkdir()
+    first = int(poppler("run", "--detach", "--", "true", cwd=tmp_path).stdout)
+    result = poppler(
+        "run",
+        "-d",
+        f"afterok:{first}",
+        "--export",
+        "ALL,GREETING=hi",
+        "-D",
+        "sub",
+        "--",
+        'echo "$GREETING"; pwd',
+        cwd=tmp_path,
+    )
+    assert result.stdout == f"hi\n{tmp_path / 'sub'}\n"
+    assert jobs.load(first + 1).dependency == f"afterok:{first}"
+    assert "only ALL" in poppler("run", "--export", "GREETING=hi", "--", "true").stderr
+
+
+def test_list_filters(tmp_path):
+    poppler("run", "--owner", "a", "--", "true", cwd=tmp_path)
+    poppler("run", "--owner", "b", "--", "exit 1", cwd=tmp_path)
+    rows = json.loads(poppler("list", "-u", "b", "-t", "failed", "--json").stdout)
+    assert [row["owner"] for row in rows] == ["b"]
+    assert "unknown state" in poppler("list", "-t", "DONE").stderr

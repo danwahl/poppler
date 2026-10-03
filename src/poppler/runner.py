@@ -75,13 +75,22 @@ class Runner:
         if self.running:
             self.preempted = True
 
-    def wait_for_gpu(self) -> TextIO | None:
+    def wait_for_gpu(self, log: BinaryIO) -> TextIO | None:
         """Return the lock file, locked, once this job is first in the queue.
 
         While first, signal any running job this job's QOS may preempt, once per
-        poll until that job stops. Returns None if the job is cancelled first.
+        poll until that job stops. Returns None if the job is cancelled first,
+        or if its dependencies can never be met, as Slurm does with
+        kill_invalid_depend.
         """
         while not self.cancelled:
+            deps = jobs.dependency_state(self.job)
+            if deps == "never":
+                log.write(b"poppler: cancelled because its dependency can never be satisfied\n")
+                return None
+            if deps == "waiting":
+                time.sleep(jobs.POLL)
+                continue
             pending = jobs.queue()
             if pending and pending[0].id == self.job.id:
                 lock = open(jobs.lock_path(), "a")  # noqa: SIM115 (returned to the caller)
@@ -117,6 +126,7 @@ class Runner:
                 start_new_session=True,
                 env={
                     **os.environ,
+                    **job.env,
                     "POPPLER_JOB_ID": str(job.id),
                     "POPPLER_RESTART_COUNT": str(job.restart_count),
                 },
@@ -177,7 +187,7 @@ def run(job_id: int) -> None:
     job.save()
     with open(job.log_path, "ab") as log:
         while True:
-            lock = runner.wait_for_gpu()
+            lock = runner.wait_for_gpu(log)
             if lock is None:
                 jobs.finish(job, jobs.CANCELLED)
                 return

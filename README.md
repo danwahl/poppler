@@ -22,9 +22,10 @@ uv tool install git+https://github.com/danwahl/poppler
 
 ```sh
 poppler run -- uv run python train.py --epochs 3   # wait, run, stream output
-poppler run -d -J sweep -t 1:00:00 -- ./sweep.sh   # print the job id and return
-poppler status          # GPU state and active jobs
-poppler list            # recent jobs
+poppler run --detach -J sweep -t 1:00:00 -- ./sweep.sh   # print the job id and return
+poppler run --detach -d afterok:12 -- ./report.sh        # start once job 12 completes
+poppler status          # GPU state, active jobs, and why pending jobs wait
+poppler list -u dan -t FAILED   # recent jobs, filtered by owner and state
 poppler log 12 -f       # follow a job's output
 poppler cancel 12
 ```
@@ -33,7 +34,11 @@ poppler cancel 12
 
 `-t` takes a time limit in Slurm's formats: `minutes`, `minutes:seconds`, `hours:minutes:seconds`, `days-hours`, `days-hours:minutes`, `days-hours:minutes:seconds`. `0` or `UNLIMITED` means no limit.
 
-Jobs see `POPPLER_JOB_ID` and `POPPLER_RESTART_COUNT` in their environment.
+`-d`/`--dependency` takes Slurm's syntax. `afterok:ID[:ID...]` waits for those jobs to complete, and `afterany:ID[:ID...]` waits for them to end in any state. Join conditions with commas; all of them must hold. If a job named by `afterok` ends in any state other than `COMPLETED`, the dependent job is cancelled, as Slurm does with `kill_invalid_depend`. A job waiting on a dependency does not hold up the jobs behind it, and does not preempt anything.
+
+`poppler status` gives each pending job Slurm's reason for waiting: `Resources` for the next job to start once the GPU is free, `Priority` for jobs behind it, `Dependency` for jobs waiting on others, and `DependencyNeverSatisfied` for a job about to be cancelled.
+
+Jobs run in the current directory, or the one given by `-D`/`--chdir`. They inherit the environment of whoever submitted them, plus any variables given with `--export=ALL,NAME=value[,...]`. They also see `POPPLER_JOB_ID` and `POPPLER_RESTART_COUNT`.
 
 ## QOS and preemption
 
@@ -50,7 +55,7 @@ Within a level, pending jobs start in submission order. When the job at the fron
 `scavenger` suits long, resumable work that should use whatever GPU time is left over, such as a training run that saves a checkpoint on SIGTERM and resumes from it:
 
 ```sh
-poppler run -d -q scavenger -J train -- uv run python train.py --resume
+poppler run --detach -q scavenger -J train -- uv run python train.py --resume
 poppler run -- uv run python eval.py   # preempts train, which reruns when eval ends
 poppler run -q high -- ./smoke.sh      # jumps ahead of pending normal jobs
 ```
@@ -73,7 +78,7 @@ A job keeps the `KillWait` in effect when it was submitted.
 claude mcp add --scope user poppler -- poppler mcp
 ```
 
-The server's tools are `gpu_status`, `submit`, `wait_job`, `job_log`, `list_jobs` and `cancel_job`. Its instructions tell agents to run GPU work through `submit`, identify themselves with `owner`, use the `normal` QOS unless asked otherwise, checkpoint on SIGTERM and cancel only their own jobs. A job's working directory defaults to the server's, so agents should pass `cwd`.
+The server's tools are `gpu_status`, `submit`, `wait_job`, `job_log`, `list_jobs`, `job_info` and `cancel_job`. `gpu_status` and `list_jobs` return short summaries, and `list_jobs` filters by owner and state. The server's instructions tell agents to run GPU work through `submit`, identify themselves with `owner`, use the `normal` QOS unless asked otherwise, keep commands that cannot resume out of `scavenger`, checkpoint on SIGTERM and cancel only their own jobs. A job's working directory defaults to the server's, so agents should pass `cwd`.
 
 ## Slurm equivalents
 
@@ -81,16 +86,21 @@ poppler borrows Slurm's names where it has the same feature, and leaves out the 
 
 | poppler | Slurm |
 |---|---|
-| `poppler run` | `srun`, or `sbatch` with `-d` |
+| `poppler run` | `srun` |
+| `poppler run --detach` | `sbatch` |
 | `poppler status`, `poppler list` | `squeue`, `sacct` |
 | `poppler cancel` | `scancel` |
-| `-J`/`--job-name`, `-t`/`--time`, `-q`/`--qos`, `--requeue`/`--no-requeue` | the same options |
+| `-J`/`--job-name`, `-t`/`--time`, `-q`/`--qos`, `--requeue`/`--no-requeue`, `-D`/`--chdir` | the same options |
+| `-d`/`--dependency` with `afterok` and `afterany` | the same option, with `SchedulerParameters=kill_invalid_depend` |
+| `--export=ALL,NAME=value` | the same option; other forms are not supported |
+| `poppler list -u`/`--owner`, `-t`/`--states` | `squeue -u`/`--user`, `-t`/`--states` |
+| pending reasons `Resources`, `Priority`, `Dependency`, `DependencyNeverSatisfied` | the same reasons |
 | job states other than `LOST` | the same states |
 | `KillWait` | `KillWait` in `slurm.conf` |
 | the three QOS levels | QOS `Priority` and `Preempt` set with `sacctmgr`, with `PriorityWeightQOS`, `PreemptType=preempt/qos` and `PreemptMode=REQUEUE` |
 | `POPPLER_JOB_ID`, `POPPLER_RESTART_COUNT` | `SLURM_JOB_ID`, `SLURM_RESTART_COUNT` |
 
-There are no partitions, accounts, fair-share, `--nice`, job arrays, dependencies, `GraceTime` or suspend-based preemption. The QOS levels cannot be configured.
+There are no partitions, accounts, fair-share, `--nice`, job arrays, other dependency types, `GraceTime` or suspend-based preemption. The QOS levels cannot be configured.
 
 ## Limits
 

@@ -29,12 +29,19 @@ scavenger job. Use normal unless the user asks for another QOS.
 same id and later reruns the same command from the start, with \
 POPPLER_RESTART_COUNT one higher. Its log keeps the output of earlier runs. \
 A scavenger job's command should save a checkpoint on SIGTERM and resume from \
-it when rerun.
+it when rerun. If a command cannot resume, submit it with QOS normal, or with \
+requeue false so it is not rerun from scratch.
+- To run jobs in sequence, pass `dependency`, e.g. "afterok:16" to start \
+once job 16 exits 0. If job 16 ends any other way, the dependent \
+job is cancelled. "afterany:16" starts once job 16 ends, however it ends.
 - A job holds the GPU until it exits, so do not submit long-lived servers \
 unless the user asks for one.
 - When a job is cancelled, preempted or reaches its time limit, its \
 processes get SIGTERM, then SIGKILL after the machine's KillWait (30 \
 seconds by default). Long jobs should save a checkpoint on SIGTERM.
+- gpu_status shows the active jobs and why each pending job is waiting. \
+list_jobs shows history; filter it with `owner` and `states`. Both return \
+summaries; job_info returns a job's full record.
 - Submitting jobs, waiting on them and reading logs need no confirmation. \
 Cancel only your own jobs unless the user asks otherwise.
 """
@@ -50,7 +57,10 @@ JobId = Annotated[int, Field(description="Job id, as returned by submit or list_
 def gpu_status() -> dict[str, Any]:
     """Show whether the GPU is busy, GPU memory and utilization, and active jobs.
 
-    LOST jobs had their runner die without recording an outcome;
+    Pending jobs are listed in start order, each with Slurm's reason for
+    waiting: Resources (next to start, once the GPU is free), Priority (other
+    jobs start first), Dependency, or DependencyNeverSatisfied (about to be
+    cancelled). LOST jobs had their runner die without recording an outcome;
     their command may still hold the GPU until cancelled. lock_holders lists
     the pids with the lock open whenever the GPU is busy.
     """
@@ -96,6 +106,22 @@ def submit(
             "If false, end as PREEMPTED."
         ),
     ] = True,
+    dependency: Annotated[
+        str,
+        Field(
+            description="Jobs that must end first, in Slurm's syntax: afterok:ID[:ID...] "
+            "to wait for them to complete, afterany:ID[:ID...] to wait for them to end "
+            "in any state. Join conditions with commas; all must hold. If an afterok "
+            "job ends in any state other than COMPLETED, this job is cancelled."
+        ),
+    ] = "",
+    env: Annotated[
+        dict[str, str] | None,
+        Field(
+            description="Environment variables to set for the job, on top of the "
+            "environment the MCP server was started with."
+        ),
+    ] = None,
 ) -> dict[str, Any]:
     """Queue a command for the GPU and return its job record without waiting.
 
@@ -111,6 +137,8 @@ def submit(
         time_limit=time_limit_s,
         qos=qos,
         requeue=requeue,
+        dependency=dependency,
+        env=env,
     )
     return job.to_dict()
 
@@ -144,13 +172,24 @@ def job_log(
 
 
 @mcp.tool(annotations=READ_ONLY)
+def job_info(job_id: JobId) -> dict[str, Any]:
+    """Return a job's full record, including its working directory, environment and log path."""
+    return jobs.load_settled(job_id).to_dict()
+
+
+@mcp.tool(annotations=READ_ONLY)
 def list_jobs(
+    owner: Annotated[str | None, Field(description="Only jobs with this owner.")] = None,
+    states: Annotated[
+        list[jobs.State] | None,
+        Field(description='Only jobs in these states, e.g. ["PENDING", "RUNNING"].'),
+    ] = None,
     limit: Annotated[
-        int, Field(ge=1, description="How many of the most recent jobs to return.")
+        int, Field(ge=1, description="How many of the most recent matching jobs to return.")
     ] = 20,
 ) -> list[dict[str, Any]]:
-    """List recent jobs, oldest first, in every state."""
-    return [job.to_dict() for job in jobs.all_jobs()[-limit:]]
+    """List recent jobs, oldest first, as summaries. job_info has the full record."""
+    return [job.summary() for job in jobs.select(owner, states)[-limit:]]
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, openWorldHint=False))
